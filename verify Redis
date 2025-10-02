@@ -1,0 +1,1 @@
+docker exec -it $(docker ps -qf name=redis) redis-cli CONFIG GET notify-keyspace-events
