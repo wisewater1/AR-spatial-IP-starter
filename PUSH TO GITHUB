@@ -1,0 +1,10 @@
+---
+# push to GitHub
+```bash
+git init
+git add .
+git commit -m "feat: initial Crystal services + Redis TTL demo"
+gh repo create spatial-ip-starter --public --source=. --remote=origin --push  # if using GitHub CLI
+# or create the repo on github.com and then:
+# git remote add origin git@github.com:<you>/spatial-ip-starter.git
+# git push -u origin main
