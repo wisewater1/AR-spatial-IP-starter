@@ -1,0 +1,4 @@
+curl -sX POST http://localhost:8082/notes \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"pose":{"x":0,"y":0,"z":0,"qx":0,"qy":0,"qz":0,"qw":1},"ttl_ms":5000}'
