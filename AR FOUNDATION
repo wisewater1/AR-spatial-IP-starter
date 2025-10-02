@@ -1,0 +1,65 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.XR.ARFoundation;
+using UnityEngine.XR.ARSubsystems;
+
+public class PlaceTimedNote : MonoBehaviour
+{
+    [Header("Refs")]
+    public ARRaycastManager raycastManager;
+    public ARAnchorManager anchorManager;
+    public Camera arCamera;
+    public GameObject notePrefab;
+
+    [Header("Behavior")]
+    [Tooltip("Time-to-live in seconds for each note")]
+    public float ttlSeconds = 60f;
+
+    static List<ARRaycastHit> hits = new List<ARRaycastHit>();
+
+    void Reset()
+    {
+        arCamera = Camera.main;
+        raycastManager = GetComponent<ARRaycastManager>();
+        anchorManager = GetComponent<ARAnchorManager>();
+    }
+
+    void Update()
+    {
+        if (Input.touchCount == 0) return;
+        var touch = Input.GetTouch(0);
+        if (touch.phase != TouchPhase.Began) return;
+
+        if (raycastManager.Raycast(
+              touch.position,
+              hits,
+              TrackableType.PlaneWithinPolygon | TrackableType.FeaturePoint))
+        {
+            var hit = hits[0];
+
+            // Create a world-stabilized reference at the hit
+            ARAnchor anchor = anchorManager.AddAnchor(
+                new Pose(hit.pose.position, hit.pose.rotation));
+            if (anchor == null) return;
+
+            // Place the note under that anchor
+            var note = Instantiate(notePrefab, anchor.transform);
+
+            // Make the note face the camera (billboarding at spawn)
+            Vector3 lookAt = arCamera.transform.position;
+            lookAt.y = anchor.transform.position.y; // keep upright
+            note.transform.LookAt(lookAt);
+            note.transform.Rotate(0, 180f, 0);
+
+            // Start a timer; destroy the whole anchor after TTL
+            StartCoroutine(ExpireAfterTTL(anchor.gameObject, ttlSeconds));
+        }
+    }
+
+    IEnumerator ExpireAfterTTL(GameObject go, float seconds)
+    {
+        yield return new WaitForSeconds(seconds);
+        Destroy(go);
+    }
+}
