@@ -1,0 +1,316 @@
+# 1) create repo files + folders
+mkdir -p spatial-ip-starter/{services/{auth-svc,notes-svc,audit-svc}/src,db/migrations,scripts}
+cd spatial-ip-starter
+
+# 2) write files
+cat > .gitignore <<'EOF'
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+
+# Node/JS (for local tools like wscat)
+node_modules/
+
+# Docker
+*.log
+docker-data/
+EOF
+
+cat > LICENSE <<'EOF'
+MIT License
+
+Copyright (c) 2025 …
+
+Permission is hereby granted, free of charge, to any person obtaining a copy…
+(keep standard MIT text or paste your org’s license)
+EOF
+
+cat > docker-compose.yml <<'EOF'
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: spatialip
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    # Emit key-expiration events (E=Keyevent, x=expired)
+    command: ["redis-server", "--notify-keyspace-events", "Ex"]
+    ports: ["6379:6379"]
+
+  auth-svc:
+    build: ./services/auth-svc
+    environment:
+      JWT_SECRET: "dev_super_secret_change_me"
+      ISSUER: "spatial-ip"
+    ports: ["8081:8081"]
+    depends_on: [redis]
+
+  notes-svc:
+    build: ./services/notes-svc
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      JWT_SECRET: "dev_secret"      # dev only; swap to RS256/JWKS later
+      BIND: "0.0.0.0:8082"
+    ports: ["8082:8082"]
+    depends_on: [redis]
+
+  audit-svc:
+    build: ./services/audit-svc
+    environment:
+      BIND: "0.0.0.0:8083"
+    ports: ["8083:8083"]
+    depends_on: [redis]
+
+volumes:
+  pgdata: {}
+EOF
+
+# ---------- services/auth-svc ----------
+cat > services/auth-svc/shard.yml <<'EOF'
+name: auth_svc
+version: 0.1.0
+authors:
+  - you <you@example.com>
+dependencies:
+  kemal:
+    github: kemalcr/kemal
+  jwt:
+    github: crystal-community/jwt
+license: MIT
+EOF
+
+cat > services/auth-svc/Dockerfile <<'EOF'
+FROM crystallang/crystal:1.12-alpine AS build
+WORKDIR /app
+COPY shard.yml shard.lock* ./
+RUN shards install
+COPY src ./src
+RUN shards build --release --no-debug --static auth_svc
+FROM alpine:3.19
+WORKDIR /app
+ENV PORT=8081
+COPY --from=build /app/bin/auth_svc /usr/local/bin/auth_svc
+CMD ["auth_svc"]
+EOF
+
+cat > services/auth-svc/src/auth_svc.cr <<'EOF'
+require "kemal"
+require "jwt"
+
+jwt_secret = ENV["JWT_SECRET"]? || "dev_super_secret_change_me"
+issuer     = ENV["ISSUER"]?     || "spatial-ip"
+
+post "/token" do |env|
+  b = env.params.json?
+  device_id = b.try &.["device_id"].as_s? || "dev"
+  user_id   = b.try &.["user_id"].as_s?   || "anon"
+  payload = {
+    "iss" => issuer,
+    "sub" => user_id,
+    "dev" => device_id,
+    "iat" => Time.utc.to_unix,
+    "exp" => (Time.utc + 1.hours).to_unix
+  }
+  token = JWT.encode(payload, jwt_secret, JWT::Algorithm::HS256)
+  env.json({token: token})
+end
+
+Kemal.run 8081
+EOF
+
+# ---------- services/notes-svc ----------
+cat > services/notes-svc/shard.yml <<'EOF'
+name: notes_svc
+version: 0.1.0
+authors:
+  - you <you@example.com>
+dependencies:
+  kemal:
+    github: kemalcr/kemal
+  redis:
+    github: stefanwille/crystal-redis
+  jwt:
+    github: crystal-community/jwt
+license: MIT
+EOF
+
+cat > services/notes-svc/Dockerfile <<'EOF'
+FROM crystallang/crystal:1.12-alpine AS build
+WORKDIR /app
+COPY shard.yml shard.lock* ./
+RUN shards install
+COPY src ./src
+RUN shards build --release --no-debug --static notes_svc
+FROM alpine:3.19
+WORKDIR /app
+ENV PORT=8082
+COPY --from=build /app/bin/notes_svc /usr/local/bin/notes_svc
+CMD ["notes_svc"]
+EOF
+
+cat > services/notes-svc/src/notes_svc.cr <<'EOF'
+require "kemal"
+require "redis"
+require "jwt"
+require "json"
+
+REDIS_URL = ENV["REDIS_URL"]? || "redis://redis:6379/0"
+BIND      = ENV["BIND"]?      || "0.0.0.0:8082"
+JWT_SECRET= ENV["JWT_SECRET"]?|| "dev_secret"
+
+struct Pose
+  include JSON::Serializable
+  property x : Float64; property y : Float64; property z : Float64
+  property qx : Float64; property qy : Float64; property qz : Float64; property qw : Float64
+end
+
+struct NoteCreate
+  include JSON::Serializable
+  property id : String? = nil
+  property pose : Pose
+  property ttl_ms : Int64
+  property payload_b64 : String? = nil
+end
+
+PUB = Redis.new(url: REDIS_URL)
+RDS = Redis.new(url: REDIS_URL)
+
+# Listen for Redis key expiration events: "__keyevent@*__:expired"
+spawn do
+  sub = Redis::Subscription.new(Redis.new(url: REDIS_URL))
+  sub.psubscribe "__keyevent@*__:expired" do |event, channel, pattern, message|
+    if message.starts_with?("note:ttl:")
+      note_id = message.split(":").last
+      payload = {id: note_id, phase: "EXPIRED", server_ts: Time.utc.to_unix}.to_json
+      PUB.publish("notes:state", payload)
+    end
+  end
+end
+
+before_all do |env|
+  next if env.request.path == "/health" || env.request.path == "/notes/subscribe"
+  auth = env.request.headers["Authorization"]?
+  halt env, 401, "missing auth" unless auth && auth.starts_with?("Bearer ")
+  token = auth.split(" ")[1]
+  begin
+    JWT.decode(token, JWT_SECRET, JWT::Algorithm::HS256)
+  rescue
+    halt env, 401, "bad token"
+  end
+end
+
+get "/health" { "ok" }
+
+post "/notes" do |env|
+  body = env.params.json?
+  nc = NoteCreate.from_json(body.to_json)
+  id = nc.id || "n_#{Random::Secure.hex(6)}"
+  # set TTL key so Redis will emit expiration later
+  ttl_sec = (nc.ttl_ms // 1000).to_i32
+  ttl_sec = 1 if ttl_sec <= 0
+  RDS.setex("note:ttl:#{id}", ttl_sec, "1")
+  # publish CREATED event
+  PUB.publish("notes:state", {id: id, phase: "CREATED", server_ts: Time.utc.to_unix}.to_json)
+  # return expiry time
+  expires_at = (Time.utc + nc.ttl_ms.milliseconds).to_s
+  env.json({id: id, expires_at: expires_at})
+end
+
+# WebSocket stream for note states
+ws "/notes/subscribe" do |socket|
+  sub = Redis::Subscription.new(Redis.new(url: REDIS_URL))
+  spawn do
+    sub.subscribe "notes:state" do |event, channel, msg|
+      socket.send msg
+    end
+  end
+  socket.on_close { sub.close }
+end
+
+Kemal.config.bind = BIND
+Kemal.run
+EOF
+
+# ---------- services/audit-svc ----------
+cat > services/audit-svc/shard.yml <<'EOF'
+name: audit_svc
+version: 0.1.0
+authors:
+  - you <you@example.com>
+dependencies:
+  kemal:
+    github: kemalcr/kemal
+  openssl:
+    github: crystal-lang/crystal
+license: MIT
+EOF
+
+cat > services/audit-svc/Dockerfile <<'EOF'
+FROM crystallang/crystal:1.12-alpine AS build
+WORKDIR /app
+COPY shard.yml shard.lock* ./
+RUN shards install
+COPY src ./src
+RUN shards build --release --no-debug --static audit_svc
+FROM alpine:3.19
+WORKDIR /app
+ENV PORT=8083
+COPY --from=build /app/bin/audit_svc /usr/local/bin/audit_svc
+CMD ["audit_svc"]
+EOF
+
+cat > services/audit-svc/src/audit_svc.cr <<'EOF'
+require "kemal"
+require "json"
+require "openssl"
+
+prev_hash = "GENESIS"
+
+post "/policy" do |env|
+  b = env.params.json?
+  payload = b.to_json
+  digest = OpenSSL::Digest.new("SHA256")
+  hash = digest.update(prev_hash + payload).hexdigest
+  prev_hash.replace(hash)
+  env.response.status_code = 204
+  env.response.headers["X-Audit-Hash"] = hash
+  ""
+end
+
+get "/merkle-root" do |env|
+  env.json({root: prev_hash})
+end
+
+Kemal.run 8083
+EOF
+
+# ---------- README ----------
+cat > README.md <<'EOF'
+# spatial-ip-starter
+
+Ephemeral AR notes backend (prototype) using **Crystal** microservices + **Redis** and **Docker Compose**.
+
+- `auth-svc` (8081): issues JWTs (dev HS256).
+- `notes-svc` (8082): `POST /notes` (with TTL) → publishes `CREATED`, then listens for Redis TTL expirations to publish `EXPIRED` over WebSocket `/notes/subscribe`.
+- `audit-svc` (8083): receives `/policy` events and maintains a rolling hash (basic provenance).
+
+## Why Redis notify-keyspace-events=Ex?
+We set `Ex` so Redis emits **expired key events**. `notes-svc` uses a `SETEX note:ttl:<id>` per note; when it expires, Redis triggers `EXPIRED`, and `notes-svc` pushes an `EXPIRED` state to all WS subscribers.
+
+## Quick start
+
+```bash
+docker-compose up -d postgres redis
+docker-compose up --build -d auth-svc notes-svc audit-svc
